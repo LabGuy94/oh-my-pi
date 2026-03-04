@@ -288,7 +288,10 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 
 					if (item.type === "reasoning" && currentBlock && currentBlock.type === "thinking") {
 						currentBlock.thinking = item.summary?.map(s => s.text).join("\n\n") || "";
-						currentBlock.thinkingSignature = JSON.stringify(item);
+						// Ensure we preserve the original item ID even if it was rewritten,
+						// or clear the ID if we need the upstream provider to re-verify it.
+						// For GitHub Copilot, we must ensure the ID matches the encrypted content.
+						currentBlock.thinkingSignature = JSON.stringify({ ...item, id: item.id });
 						stream.push({
 							type: "thinking_end",
 							contentIndex: blockIndex(),
