@@ -20,7 +20,7 @@ import type { Skill } from "../extensibility/skills";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { callTool } from "../mcp/client";
-import type { MCPManager } from "../mcp/manager";
+import type { MCPManager, SubAgentMCPProxy } from "../mcp/manager";
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
 import { AgentRegistry } from "../registry/agent-registry";
@@ -397,10 +397,20 @@ function getUsageTokens(usage: unknown): number {
 }
 
 /**
- * Create proxy tools that reuse the parent's MCP connections.
+ * Source of MCP tool definitions + connections used by the sub-agent proxy
+ * tools. Implemented by both {@link MCPManager} (parent process) and
+ * {@link SubAgentMCPProxy} (per-sub-agent, isolated MCP sessions).
  */
-function createMCPProxyTools(mcpManager: MCPManager): CustomTool<TSchema>[] {
-	return mcpManager.getTools().map(tool => {
+type MCPProxySource = Pick<MCPManager, "getTools" | "waitForConnection">;
+
+/**
+ * Create proxy tools that dispatch through `source.waitForConnection` for each
+ * call. Pass a {@link SubAgentMCPProxy} (from `MCPManager.forkForSubAgent()`)
+ * to give sub-agents their own MCP sessions; passing the manager itself shares
+ * the parent's sessions and is only appropriate for top-level use.
+ */
+function createMCPProxyTools(source: MCPProxySource): CustomTool<TSchema>[] {
+	return source.getTools().map(tool => {
 		const mcpTool = tool as { mcpToolName?: string; mcpServerName?: string };
 		return {
 			name: tool.name,
@@ -416,7 +426,7 @@ function createMCPProxyTools(mcpManager: MCPManager): CustomTool<TSchema>[] {
 				try {
 					const result = await withAbortTimeout(
 						(async () => {
-							const connection = await mcpManager.waitForConnection(serverName);
+							const connection = await source.waitForConnection(serverName);
 							return callTool(connection, mcpToolName, params as Record<string, unknown>, { signal });
 						})(),
 						MCP_CALL_TIMEOUT_MS,
@@ -934,6 +944,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		let error: string | undefined;
 		let aborted = false;
 		let abortReasonText: string | undefined;
+		let mcpProxy: SubAgentMCPProxy | undefined;
 		const checkAbort = () => {
 			if (abortSignal.aborted) {
 				aborted = abortReason === "signal" || abortReason === undefined;
@@ -995,7 +1006,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				sessionManager.adoptArtifactManager(options.parentArtifactManager);
 			}
 
-			const mcpProxyTools = options.mcpManager ? createMCPProxyTools(options.mcpManager) : [];
+			// Give the sub-agent its own MCP sessions (fresh `Mcp-Session-Id` per
+			// HTTP/SSE server) so stateful MCP servers can't conflate the
+			// sub-agent's tool calls with the parent's. Stdio servers — which
+			// have no session-id concept — are still shared with the parent.
+			mcpProxy = options.mcpManager?.forkForSubAgent();
+			const mcpProxyTools = mcpProxy ? createMCPProxyTools(mcpProxy) : [];
 			const enableMCP = !options.mcpManager;
 
 			const { normalized: normalizedOutputSchema } = normalizeSchema(outputSchema);
@@ -1223,6 +1239,17 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					await untilAborted(AbortSignal.timeout(5000), () => session.dispose());
 				} catch {
 					// Ignore cleanup errors
+				}
+			}
+			if (mcpProxy) {
+				const proxy = mcpProxy;
+				mcpProxy = undefined;
+				try {
+					await untilAborted(AbortSignal.timeout(5000), () => proxy.dispose());
+				} catch {
+					// Best-effort: leftover isolated MCP connections will be GC'd with
+					// the process, but failing to close them cleanly only loses the
+					// `DELETE /mcp` session-termination request to the server.
 				}
 			}
 		}

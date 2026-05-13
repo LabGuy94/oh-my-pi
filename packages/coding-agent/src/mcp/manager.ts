@@ -1153,6 +1153,157 @@ export class MCPManager {
 
 		return resolved;
 	}
+
+	/**
+	 * Open a fresh connection to a server using the manager's resolved auth/config,
+	 * without registering it as the manager's shared connection. The returned
+	 * connection has its own transport instance and (for HTTP/SSE) its own
+	 * `Mcp-Session-Id`. The caller owns the connection's lifecycle.
+	 *
+	 * Used by {@link forkForSubAgent} to give sub-agents MCP sessions that are
+	 * isolated from the parent's session state.
+	 */
+	async connectIsolated(name: string, config: MCPServerConfig): Promise<MCPServerConnection> {
+		const resolvedConfig = await this.#resolveAuthConfig(config);
+		const connection = await connectToServer(name, resolvedConfig, {
+			// Sub-agent connections respond to server-to-client requests (ping,
+			// roots/list) just like the parent's connection.
+			onRequest: (method, params) => this.#handleServerRequest(method, params),
+			// Notifications on isolated connections are intentionally not routed
+			// through the parent's #handleServerNotification: the parent owns
+			// shared state (tool list, resource subscriptions) and reacting to
+			// the sub-agent's stream would cause double-refresh and clobber the
+			// parent's subscription bookkeeping.
+			onNotification: (method, _params) => {
+				logger.debug("MCP isolated subagent notification (suppressed)", {
+					path: `mcp:${name}`,
+					method,
+				});
+			},
+		});
+		connection.config = config;
+
+		// Wire auth refresh for HTTP transports so 401s on the sub-agent's
+		// session still trigger token refresh against shared auth storage.
+		if (connection.transport instanceof HttpTransport && config.auth?.type === "oauth") {
+			connection.transport.onAuthError = async () => {
+				const refreshed = await this.#resolveAuthConfig(config, true);
+				if (refreshed.type === "http" || refreshed.type === "sse") {
+					return refreshed.headers ?? null;
+				}
+				return null;
+			};
+		}
+		// Deliberately no onClose: isolated connections are ephemeral and not
+		// auto-reconnected; the sub-agent's transport closing should fail tool
+		// calls rather than trigger reconnection (which would mutate manager state).
+
+		return connection;
+	}
+
+	/**
+	 * Create a per-sub-agent MCP proxy that exposes the manager's loaded tools
+	 * but routes tool calls through its own isolated connections (and thus its
+	 * own `Mcp-Session-Id` for HTTP/SSE servers). Stdio servers are shared with
+	 * the parent because the stdio transport has no session-id concept.
+	 *
+	 * Call {@link SubAgentMCPProxy.dispose} when the sub-agent finishes to
+	 * close any isolated connections that were opened.
+	 */
+	forkForSubAgent(): SubAgentMCPProxy {
+		return new SubAgentMCPProxy(this);
+	}
+}
+
+/**
+ * Per-sub-agent MCP proxy. Reuses the parent {@link MCPManager}'s loaded tool
+ * definitions, but each MCP tool call gets dispatched through an isolated
+ * connection (fresh `Mcp-Session-Id` for HTTP/SSE). Stdio servers — which have
+ * no session-id concept — are shared with the parent.
+ *
+ * Connections are opened lazily on first use per server and closed in
+ * {@link dispose}. If `dispose` is called while a connection is still being
+ * established, the in-flight attempt is closed as soon as it resolves.
+ */
+export class SubAgentMCPProxy {
+	readonly #parent: MCPManager;
+	readonly #ownedConnections = new Map<string, Promise<MCPServerConnection>>();
+	#disposed = false;
+
+	constructor(parent: MCPManager) {
+		this.#parent = parent;
+	}
+
+	/** Tool definitions are inherited from the parent — only the connection differs. */
+	getTools(): ReturnType<MCPManager["getTools"]> {
+		return this.#parent.getTools();
+	}
+
+	/**
+	 * Return the connection a sub-agent should use to call tools on `name`.
+	 *
+	 * - HTTP/SSE: lazily opens (and caches) an isolated connection with its
+	 *   own session id.
+	 * - Stdio (or any non-HTTP transport): returns the parent's shared
+	 *   connection — stdio has no session-id concept and respawning the
+	 *   subprocess per sub-agent would be a significant resource regression.
+	 *
+	 * If `dispose()` has already been called this throws, since callers
+	 * should not initiate new MCP work after the sub-agent finishes.
+	 */
+	async waitForConnection(name: string): Promise<MCPServerConnection> {
+		if (this.#disposed) {
+			throw new Error(`SubAgentMCPProxy disposed; cannot open MCP session for ${name}`);
+		}
+		const parentConn = await this.#parent.waitForConnection(name);
+		if (!(parentConn.transport instanceof HttpTransport)) {
+			return parentConn;
+		}
+		let pending = this.#ownedConnections.get(name);
+		if (!pending) {
+			pending = this.#parent.connectIsolated(name, parentConn.config).catch(err => {
+				// Drop the cache entry on failure so the next caller can retry.
+				if (this.#ownedConnections.get(name) === pending) {
+					this.#ownedConnections.delete(name);
+				}
+				throw err;
+			});
+			this.#ownedConnections.set(name, pending);
+		}
+		// Caller gets a derived promise that rejects once we've been disposed —
+		// the connection itself is owned by `#ownedConnections` and will be
+		// closed by `dispose()`, so we don't tear it down here.
+		return pending.then(conn => {
+			if (this.#disposed) {
+				throw new Error(`SubAgentMCPProxy disposed during connect to ${name}`);
+			}
+			return conn;
+		});
+	}
+
+	/**
+	 * Close all isolated connections opened for this sub-agent and reject any
+	 * future {@link waitForConnection} calls. Idempotent.
+	 *
+	 * If a connection is still being established, this awaits it before
+	 * closing — so the caller can rely on every opened socket being torn down
+	 * (and `DELETE /mcp` having been issued on HTTP transports) by the time
+	 * the returned promise resolves.
+	 */
+	async dispose(): Promise<void> {
+		if (this.#disposed) return;
+		this.#disposed = true;
+		const pendings = Array.from(this.#ownedConnections.values());
+		this.#ownedConnections.clear();
+		await Promise.allSettled(
+			pendings.map(pending =>
+				pending.then(
+					conn => disconnectServer(conn).catch(() => {}),
+					() => undefined,
+				),
+			),
+		);
+	}
 }
 
 /**
